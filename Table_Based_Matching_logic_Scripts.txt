@@ -1,0 +1,197 @@
+  CREATE TABLE "FORMULA_TABLE" 
+   (	"COLUMN_NAME" VARCHAR2(100), 
+	"FORMULA" VARCHAR2(1000), 
+	"TABLE_NAME" VARCHAR2(100)
+   ) ;
+
+
+create or replace procedure build_process_test_3 (p_tab_name varchar2)  as
+	  lv_formula_function clob;
+	  lv_col_data_type varchar2(4000);
+      lv_expression varchar2(32000);
+	  lv_view_sql clob;
+	  lv_column_list clob;
+      p_table_name varchar2(100):= upper(p_tab_name);
+	  lv_p_key varchar2(100);
+	  lv_where_clause varchar2(4000);
+      lv_proc_sql clob;
+	  lv_proc_copy_sql clob;
+      lv_update_sql clob;
+      lv_update_copy_sql clob;
+      lv_view_sql_column_list clob;
+	  lv_ins_copy clob;
+	  lv_ins_copy_var clob;
+	  lv_ins_where clob;
+	  lv_update_sql_var clob;
+      lv_proc_call clob;
+      lv_proc_call_columns clob;
+	  lv_check_copy_tab_exists number;
+	  
+	  begin
+	  
+	  select count(*) into lv_check_copy_tab_exists from user_tables where table_name = p_tab_name||'_COPY';
+	  if lv_check_copy_tab_exists = 0 then
+	  execute immediate 'create table '||p_tab_name||'_COPY as select * from '||p_tab_name;
+	  end if;
+	  
+	   select tc.column_name into lv_p_key from user_constraints c, user_cons_columns tc 
+	where c.table_name = p_table_name
+	and c.CONSTRAINT_TYPE = 'P'
+	and c.constraint_name = tc.constraint_name
+	and c.TABLE_NAME = tc.TABLE_NAME
+    and rownum = 1;
+	
+	  for i in (select * from user_tab_columns where table_name = p_table_name) loop
+          if i.data_type = 'DATE' then
+            lv_col_data_type := lv_col_data_type||'lv'||i.column_name||' '||i.data_type||'; '||chr(10);
+          else
+			lv_col_data_type := lv_col_data_type||'lv'||i.column_name||' '||i.data_type||'('||i.DATA_LENGTH||'); '||chr(10);
+            end if;
+	  end loop;
+	
+	  for i in (select * from user_tab_columns where table_name = p_table_name) loop
+			if i.data_type = 'VARCHAR2' then             
+				lv_expression := lv_expression|| 'l_expression :=replace(l_expression,'||chr(39)||'('||i.column_name||')'||chr(39)||',nvl(chr(39)||l_tab_rec.'||i.column_name||'||chr(39)'||',''zzz''));'||chr(10);    
+			elsif i.data_type <> 'DATE' then 
+			lv_expression := lv_expression|| 'l_expression :=replace(l_expression,'||chr(39)||'('||i.column_name||')'||chr(39)||',nvl(l_tab_rec.'||i.column_name||',0));'||chr(10);    
+			
+            end if;
+	  end loop;
+      lv_update_sql := 'update '||p_table_name||' set ';
+      lv_update_sql_var := 'update '||p_table_name||'_copy set ';
+	  lv_ins_copy   := 'insert into '||p_table_name||'_copy (';
+    for i in (select * from user_tab_columns where table_name = p_table_name) loop	
+	    lv_column_list := lv_column_list||'decode(c.'||i.column_name||',null,e.'||i.column_name||',c.'||i.column_name||') '||i.column_name||',';
+        lv_update_sql :=	lv_update_sql||i.column_name||' =i.'||i.column_name||',';
+		lv_ins_copy   :=   lv_ins_copy||i.column_name||',';
+		lv_ins_copy_var := lv_ins_copy_var ||  'p_tab_rec.'||i.column_name||',';
+		lv_update_sql_var :=	lv_update_sql_var||i.column_name||' =p_tab_rec.'||i.column_name||',';
+        lv_proc_call_columns := lv_proc_call_columns||'p_tab_rec.'||i.column_name||':=:'||i.column_name||';';
+	end loop;
+	  lv_update_sql_var := rtrim(lv_update_sql_var,',')||' where 1=1 and ';
+	  lv_update_sql := rtrim(lv_update_sql,',')||' where 1=1 and ';
+	  lv_ins_copy := rtrim(lv_ins_copy,',')||') values ('|| rtrim(lv_ins_copy_var,',')||');';
+	for i in (select tc.column_name,c.CONSTRAINT_TYPE from user_constraints c, user_cons_columns tc 
+	where c.table_name = p_table_name
+	and c.CONSTRAINT_TYPE = 'P'
+	and c.constraint_name = tc.constraint_name
+	and c.TABLE_NAME = tc.TABLE_NAME) loop
+	lv_where_clause := lv_where_clause||' e.'||i.column_name||'=c.'||i.column_name||'(+) and';
+    lv_update_sql := lv_update_sql||i.column_name||' = i.'||i.column_name||' and';
+	lv_ins_where := lv_ins_where||i.column_name||' = :'||i.column_name||' and';
+	--lv_update_sql_var := lv_update_sql_var||i.column_name||' = :'||i.column_name||' and';	
+	end loop;
+		lv_where_clause := rtrim(lv_where_clause,'and');
+        lv_update_sql := rtrim(lv_update_sql,'and')||';';
+		lv_update_sql_var := rtrim(lv_update_sql_var,'and')||' rowid=p_row_id;';
+	  lv_formula_function :=
+	  'create or replace function eval_formula_'||p_table_name||'(lv_column_name varchar2, p_row_id varchar2)
+return varchar2 is
+    l_rowsprocessed  NUMBER DEFAULT 0;
+    l_retval         varchar2(4000);
+    l_cursor         INTEGER DEFAULT dbms_sql.open_cursor;
+    l_expression     VARCHAR2(4000);
+    l_sql            VARCHAR2(4000);
+    lv_sql_code      VARCHAR2(4000);
+    l_tab_rec       '||p_table_name||'%ROWTYPE;
+	cntr number := 0;
+	l_expression_process varchar2(4000);
+    v_operator_position number;
+	'||lv_col_data_type||'
+    begin
+    begin
+    select * into l_tab_rec from '||p_table_name||' where rowid = p_row_id;
+    exception 
+    when others then
+    select * into l_tab_rec from '||p_table_name||'_copy where rowid = p_row_id;
+    --Raise_Application_Error (-20343, p_row_id);
+    end;
+    select FORMULA into l_expression from formula_table where COLUMN_NAME = lv_column_name and table_name='||chr(39)||p_table_name||chr(39)||';'||Chr(10)||
+     'for i in ( select regexp_substr(l_expression,'||chr(39)||'[^/*+-]+'||chr(39)||', 1, level) split_expr'||Chr(10)||
+    'from dual'||Chr(10)||
+    'connect BY regexp_substr(l_expression, '||chr(39)||'[^/*+-]+'||chr(39)||', 1, level)'||Chr(10)||
+    'is not null) loop '||Chr(10)||
+	'cntr := cntr + 1;'||Chr(10)||
+	'v_operator_position := REGEXP_INSTR (l_expression, '||chr(39)||'[*|/|+|-]'||chr(39)||', 1, cntr, 0, '||chr(39)||'i'||chr(39)||');'||Chr(10)||
+	 'if v_operator_position = 0 then '||Chr(10)||
+		'v_operator_position:=null; '||Chr(10)||  
+     'end if;'||Chr(10)||
+	 'if   REGEXP_INSTR (i.split_expr, '||chr(39)||'sum|avg|max|min'||chr(39)||', 1, 1, 0, '||chr(39)||'i'||chr(39)||')  > 0 then '||Chr(10)||
+	 	 'l_expression_process:= l_expression_process|| exec_dynamic_sql('||chr(39)||'select '||chr(39)||'||i.split_expr||'||chr(39)||' from '||p_table_name||'_copy'||chr(39)||') ||substr(l_expression,v_operator_position,1);'||Chr(10)||
+	 'else'||Chr(10)||
+	 'l_expression_process:= l_expression_process||i.split_expr||substr(l_expression,v_operator_position,1);'||Chr(10)||
+	 'end if;'||Chr(10)||
+	 'end loop;'||Chr(10)||
+	 'l_expression:=l_expression_process;'||Chr(10)|| 
+	lv_expression||
+    ' --l_sql            := '||chr(39)||'begin :ret_val := '||chr(39)||'|| l_expression || '||chr(39)||'; end;'||chr(39)||';'||chr(10)||
+	'execute immediate '||chr(39)||'select '||chr(39)||'||l_expression||'||chr(39)||' from dual'||chr(39)||' into l_retval;'||chr(10)||
+	'RETURN l_retval;'||chr(10)||
+    'dbms_sql.parse(l_cursor,'||chr(39)||'begin :ret_val := '||chr(39)||' || l_expression || '||chr(39)||'; end;'||chr(39)||',dbms_sql.native);'||chr(10)||'
+    dbms_sql.bind_variable(l_cursor, '||chr(39)||':ret_val'||chr(39)||',l_retval);'||chr(10)||'
+    l_rowsprocessed  := dbms_sql.execute(l_cursor);'||chr(10)||'
+    dbms_sql.variable_value(l_cursor,'||chr(39)||':ret_val'||chr(39)||',l_retval);'||chr(10)||'
+    dbms_sql.close_cursor(l_cursor);'||chr(10)||'
+    RETURN round(l_retval);'||chr(10)||'
+  EXCEPTION'||chr(10)||'
+WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+    WHEN OTHERS THEN  -- need to add more error handling'||chr(10)||'
+      lv_sql_code := sqlerrm;'||chr(10)||'
+      raise_application_error(-20501,'||chr(39)||'FUNCTION LCS Error: '||chr(39)||' || lv_sql_code || l_sql);'||chr(10)||'
+    end;'||chr(10)||'
+    ';
+	 
+execute immediate (lv_formula_function);
+	
+	for i in (select COLUMN_NAME from formula_table where TABLE_NAME = p_table_name) loop
+    --      eval_formula_EMP('AVG_SAL', decode(c.deptno,null,e.rowid,c.rowid)) 
+	lv_column_list := lv_column_list|| 'eval_formula_'||p_table_name||'('||chr(39)||i.column_name||chr(39)||',decode(c.'||lv_p_key||',null,e.rowid,c.rowid)) ' || i.column_name ||'_formula,';    
+	end loop;
+	lv_view_sql := 'create or replace view vw_'||p_table_name||' as select '||rtrim(lv_column_list,',')||' from '
+	||'(select c.*,rowid from '||p_table_name||'_copy'||' c) c,'
+	||'(select e.*,rowid from '||p_table_name||' e) e '
+	||'where  1=1 and '
+	||lv_where_clause;
+     dbms_output.put_line(lv_view_sql);
+	execute immediate lv_view_sql;
+    lv_view_sql_column_list := ' select '||rtrim(lv_column_list,',')||' from '
+	||'(select c.*,rowid from '||p_table_name||'_copy'||' c) c,'
+	||'(select e.*,rowid from '||p_table_name||' e) e '
+	||'where  1=1 and '
+	||lv_where_clause;
+    lv_proc_sql := 'create or replace procedure update_'||p_table_name||' is'||chr(10)||
+                    'begin'||chr(10)||
+                    'for i in ('||lv_view_sql_column_list||chr(10)||
+                    ') loop'||chr(10)||
+                        lv_update_sql||chr(10)||
+                    'end loop;'||chr(10)||
+                    ' end;' ;
+    dbms_output.put_line(lv_proc_sql);
+    execute immediate lv_proc_sql;
+    
+     lv_proc_copy_sql := 'create or replace procedure update_'||p_table_name||'_copy(p_tab_rec  '||p_table_name||'_copy%ROWTYPE,p_row_id varchar2) is'||chr(10)||
+	 	
+			'begin'||chr(10)||
+			'if p_row_id is null then'||chr(10)||
+			lv_ins_copy||chr(10)||
+			'else '||chr(10)||
+	        lv_update_sql_var||chr(10)||
+			'end if;'||chr(10)||
+			'commit;'||chr(10)||
+			'end;';
+			execute immediate lv_proc_copy_sql;
+            dbms_output.put_line(lv_proc_copy_sql);
+
+lv_proc_call := 'declare'||chr(10)||
+'p_tab_rec  '||p_table_name||'_COPY%ROWTYPE;'||chr(10)||
+'begin'||chr(10)||
+lv_proc_call_columns||chr(10)||
+'update_'||p_table_name||'_COPY(p_tab_rec  => p_tab_rec,p_row_id => null);'||chr(10)||
+'end;';
+dbms_output.put_line(lv_proc_call);
+exception when others then
+dbms_output.put_line(lv_view_sql);
+
+	end;
+/
